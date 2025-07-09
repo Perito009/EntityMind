@@ -15,7 +15,7 @@ def login():
     """Login and get access token"""
     response = requests.post(
         f"{API_BASE_URL}/api/auth/login",
-        data={
+        params={
             "username": ADMIN_USERNAME,
             "password": ADMIN_PASSWORD
         }
