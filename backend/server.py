@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, status, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Depends, status, WebSocket, WebSocketDisconnect, File, UploadFile
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 import asyncio
@@ -15,13 +15,13 @@ import redis.asyncio as redis
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel, Field
-import dlib
-from deepface import DeepFace
 import logging
 from sklearn.metrics.pairwise import cosine_similarity
 import uuid
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from PIL import Image
+import io
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -55,8 +55,7 @@ security = HTTPBearer()
 # Global variables
 mongo_client = None
 redis_client = None
-face_detector = None
-face_recognizer = None
+face_cascade = None
 executor = ThreadPoolExecutor(max_workers=4)
 
 # Pydantic models
@@ -139,23 +138,20 @@ async def init_db():
                 "created_at": datetime.utcnow()
             })
         
+        # Initialize Redis with default count
+        await redis_client.set("current_count", "0")
+        
         logger.info("Database connections initialized successfully")
     except Exception as e:
         logger.error(f"Database initialization failed: {e}")
 
 # Facial recognition initialization
 async def init_face_recognition():
-    global face_detector, face_recognizer
+    global face_cascade
     try:
-        # Initialize dlib face detector
-        face_detector = dlib.get_frontal_face_detector()
-        
-        # Initialize face recognizer (using dlib's face recognition model)
-        predictor_path = "shape_predictor_68_face_landmarks.dat"
-        face_rec_model_path = "dlib_face_recognition_resnet_model_v1.dat"
-        
-        # For now, we'll use OpenCV's face detection and DeepFace for embeddings
-        logger.info("Face recognition initialized with OpenCV and DeepFace")
+        # Initialize OpenCV face cascade
+        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        logger.info("Face recognition initialized with OpenCV")
     except Exception as e:
         logger.error(f"Face recognition initialization failed: {e}")
 
@@ -176,11 +172,11 @@ def verify_password(plain_password, hashed_password):
 def get_password_hash(password):
     return pwd_context.hash(password)
 
-def anonymize_face_embedding(embedding):
-    """Create anonymized hash from face embedding"""
-    embedding_str = str(embedding.tolist())
-    salted_embedding = f"{embedding_str}{ANONYMIZATION_SALT}"
-    return hashlib.sha256(salted_embedding.encode()).hexdigest()
+def anonymize_face_embedding(face_data):
+    """Create anonymized hash from face data"""
+    face_str = str(face_data)
+    salted_face = f"{face_str}{ANONYMIZATION_SALT}"
+    return hashlib.sha256(salted_face.encode()).hexdigest()
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     credentials_exception = HTTPException(
@@ -212,49 +208,45 @@ def require_admin(current_user: dict = Depends(get_current_user)):
 
 # Face processing functions
 async def process_frame_for_faces(frame):
-    """Process a single frame to detect and recognize faces"""
+    """Process a single frame to detect faces"""
     try:
-        # Convert frame to RGB
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # Convert frame to grayscale for face detection
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
-        # Detect faces using OpenCV
-        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-        faces = face_cascade.detectMultiScale(rgb_frame, 1.1, 4)
+        # Detect faces
+        faces = face_cascade.detectMultiScale(gray, 1.1, 4)
         
-        face_embeddings = []
-        
+        face_data = []
         for (x, y, w, h) in faces:
             # Extract face region
-            face_region = rgb_frame[y:y+h, x:x+w]
+            face_region = gray[y:y+h, x:x+w]
             
-            try:
-                # Get face embedding using DeepFace
-                result = DeepFace.represent(face_region, model_name="Facenet", enforce_detection=False)
-                if result:
-                    embedding = np.array(result[0]["embedding"])
-                    anonymized_hash = anonymize_face_embedding(embedding)
-                    face_embeddings.append({
-                        "hash": anonymized_hash,
-                        "bbox": [x, y, w, h],
-                        "embedding": embedding
-                    })
-            except Exception as e:
-                logger.warning(f"Failed to process face: {e}")
-                continue
+            # Create a simple face descriptor using histogram
+            face_descriptor = cv2.calcHist([face_region], [0], None, [256], [0, 256])
+            face_descriptor = face_descriptor.flatten()
+            
+            # Anonymize the face data
+            anonymized_hash = anonymize_face_embedding(face_descriptor.tolist())
+            
+            face_data.append({
+                "hash": anonymized_hash,
+                "bbox": [int(x), int(y), int(w), int(h)],
+                "confidence": 0.8  # Mock confidence score
+            })
         
-        return face_embeddings
+        return face_data
     except Exception as e:
         logger.error(f"Frame processing error: {e}")
         return []
 
-async def update_face_database(face_embeddings):
-    """Update face database with new embeddings"""
+async def update_face_database(face_data):
+    """Update face database with new face detections"""
     try:
         db = mongo_client.entitymind
         current_time = datetime.utcnow()
         
-        for face_data in face_embeddings:
-            face_hash = face_data["hash"]
+        for face in face_data:
+            face_hash = face["hash"]
             
             # Check if face already exists
             existing_face = await db.face_embeddings.find_one({"embedding_hash": face_hash})
@@ -277,7 +269,25 @@ async def update_face_database(face_embeddings):
                     "count": 1
                 })
         
-        return len(face_embeddings)
+        # Update current count
+        unique_faces = len(face_data)
+        await redis_client.set("current_count", str(unique_faces))
+        
+        # Store historical data
+        await db.people_counts.insert_one({
+            "count": unique_faces,
+            "timestamp": current_time,
+            "zone_id": "default",
+            "anonymized_faces": [face["hash"] for face in face_data]
+        })
+        
+        # Broadcast to WebSocket clients
+        await manager.broadcast(json.dumps({
+            "count": unique_faces,
+            "timestamp": current_time.isoformat()
+        }))
+        
+        return unique_faces
     except Exception as e:
         logger.error(f"Face database update error: {e}")
         return 0
@@ -355,15 +365,61 @@ async def get_count_history(current_user: dict = Depends(get_current_user)):
         return {"history": []}
 
 @app.post("/api/process/frame")
-async def process_frame(current_user: dict = Depends(get_current_user)):
-    """Process a frame for facial recognition (placeholder for camera integration)"""
+async def process_frame(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
+    """Process an uploaded frame for facial recognition"""
     try:
-        # This would normally receive camera frame data
-        # For now, return a mock response
-        return {"status": "processed", "faces_detected": 0}
+        # Read uploaded file
+        contents = await file.read()
+        
+        # Convert to OpenCV format
+        nparr = np.frombuffer(contents, np.uint8)
+        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        if frame is None:
+            raise HTTPException(status_code=400, detail="Invalid image format")
+        
+        # Process frame for faces
+        face_data = await process_frame_for_faces(frame)
+        
+        # Update database
+        count = await update_face_database(face_data)
+        
+        return {
+            "status": "processed",
+            "faces_detected": len(face_data),
+            "current_count": count,
+            "faces": face_data
+        }
     except Exception as e:
         logger.error(f"Frame processing error: {e}")
         raise HTTPException(status_code=500, detail="Frame processing failed")
+
+@app.post("/api/simulate/count")
+async def simulate_count(count: int, current_user: dict = Depends(get_current_user)):
+    """Simulate people count for testing (MVP feature)"""
+    try:
+        # Update Redis
+        await redis_client.set("current_count", str(count))
+        
+        # Store in database
+        db = mongo_client.entitymind
+        await db.people_counts.insert_one({
+            "count": count,
+            "timestamp": datetime.utcnow(),
+            "zone_id": "default",
+            "anonymized_faces": [f"simulated_{i}" for i in range(count)]
+        })
+        
+        # Broadcast to WebSocket clients
+        await manager.broadcast(json.dumps({
+            "count": count,
+            "timestamp": datetime.utcnow().isoformat()
+        }))
+        
+        return {"status": "success", "count": count}
+    except Exception as e:
+        logger.error(f"Simulation error: {e}")
+        raise HTTPException(status_code=500, detail="Simulation failed")
 
 @app.websocket("/ws/live-count")
 async def websocket_live_count(websocket: WebSocket):
